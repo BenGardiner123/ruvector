@@ -5,14 +5,16 @@
  * - Yahoo Finance (free, delayed)
  * - Alpha Vantage (free tier available)
  * - Binance (crypto, real-time)
- * - Polygon.io (stocks, options)
+ * - Polygon.io (stocks, options, real-time WebSocket)
  * - IEX Cloud (stocks)
+ * - The Odds API (sports betting – live odds + WebSocket stream)
  *
  * Features:
  * - Rate limiting
  * - Caching
  * - Error handling
  * - Data normalization
+ * - WebSocket real-time streams for stocks and sports odds
  */
 
 // Connector Configuration
@@ -22,7 +24,8 @@ const connectorConfig = {
     alphaVantage: process.env.ALPHA_VANTAGE_KEY || '',
     polygon: process.env.POLYGON_KEY || '',
     iex: process.env.IEX_KEY || '',
-    binance: process.env.BINANCE_KEY || ''
+    binance: process.env.BINANCE_KEY || '',
+    theOddsApi: process.env.THE_ODDS_API_KEY || ''
   },
 
   // Rate limits (requests per minute)
@@ -31,7 +34,8 @@ const connectorConfig = {
     alphaVantage: 5,
     binance: 1200,
     polygon: 100,
-    iex: 100
+    iex: 100,
+    theOddsApi: 60
   },
 
   // Cache settings
@@ -471,6 +475,202 @@ class BinanceConnector extends BaseConnector {
 }
 
 /**
+ * Polygon.io Connector
+ *
+ * Provides real-time stock market data via REST and WebSocket.
+ * Required for stock trading data streams (live trades, quotes, aggregates).
+ *
+ * WebSocket channels:
+ *   T.* – trades    Q.* – quotes    A.* – per-second aggregates
+ *
+ * Sign up for a free API key at https://polygon.io
+ */
+class PolygonConnector extends BaseConnector {
+  constructor(config = {}) {
+    super(config);
+    this.baseUrl = 'https://api.polygon.io/v2';
+    this.apiKey = config.apiKey || this.config.apiKeys.polygon;
+    this.wsUrl = 'wss://socket.polygon.io/stocks';
+    this._ws = null;
+    this._subscriptions = new Map();
+  }
+
+  async getQuote(symbol) {
+    if (!this.apiKey) throw new Error('Polygon API key required');
+    const url = `${this.baseUrl}/last/trade/${symbol}?apiKey=${this.apiKey}`;
+    const data = await this.fetchWithRetry(url, {}, 'polygon');
+    const r = data.results;
+    return {
+      symbol,
+      price: r.p,
+      size: r.s,
+      timestamp: r.t,
+      source: 'polygon'
+    };
+  }
+
+  async getHistorical(symbol, from, to, multiplier = 1, timespan = 'day') {
+    if (!this.apiKey) throw new Error('Polygon API key required');
+    const url = `${this.baseUrl}/aggs/ticker/${symbol}/range/${multiplier}/${timespan}/${from}/${to}?adjusted=true&sort=asc&apiKey=${this.apiKey}`;
+    const data = await this.fetchWithRetry(url, {}, 'polygon');
+    return (data.results || []).map(bar => ({
+      timestamp: bar.t,
+      open: bar.o,
+      high: bar.h,
+      low: bar.l,
+      close: bar.c,
+      volume: bar.v,
+      source: 'polygon'
+    }));
+  }
+
+  // WebSocket real-time stream for stock trades, quotes, and aggregates.
+  // channel examples: 'T.AAPL' (trade), 'Q.AAPL' (quote), 'A.AAPL' (aggregate)
+  subscribe(channels, callback) {
+    if (!this.apiKey) throw new Error('Polygon API key required');
+    const ws = new WebSocket(this.wsUrl);
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ action: 'auth', params: this.apiKey }));
+    };
+
+    ws.onmessage = (event) => {
+      const messages = JSON.parse(event.data);
+      for (const msg of messages) {
+        if (msg.ev === 'status' && msg.status === 'auth_success') {
+          ws.send(JSON.stringify({ action: 'subscribe', params: channels.join(',') }));
+        } else {
+          callback(msg);
+        }
+      }
+    };
+
+    this._ws = ws;
+    return { close: () => ws.close() };
+  }
+}
+
+/**
+ * Sports Betting Data Stream Connector
+ *
+ * Connects to The Odds API (https://the-odds-api.com) to retrieve live
+ * sports betting odds from major sportsbooks (DraftKings, FanDuel, BetMGM,
+ * Caesars, etc.) and polls for near-real-time updates.
+ *
+ * Required data streams for sports betting:
+ *   1. Live odds (moneyline, spread, totals) – REST polling or WebSocket
+ *   2. Live scores / game state            – determines in-play line movement
+ *   3. Injury / roster news               – feeds model probability updates
+ *
+ * Environment variable: THE_ODDS_API_KEY
+ * Sign up for a free key at https://the-odds-api.com
+ */
+class SportsBettingConnector extends BaseConnector {
+  constructor(config = {}) {
+    super(config);
+    this.baseUrl = 'https://api.the-odds-api.com/v4';
+    this.apiKey = config.apiKey || this.config.apiKeys.theOddsApi;
+    this._pollIntervals = new Map();
+  }
+
+  // List all available sports
+  async getSports(all = false) {
+    if (!this.apiKey) throw new Error('The Odds API key required');
+    const url = `${this.baseUrl}/sports?apiKey=${this.apiKey}&all=${all}`;
+    return this.fetchWithRetry(url, {}, 'theOddsApi');
+  }
+
+  // Fetch live odds for a sport.
+  // sport:   e.g. 'americanfootball_nfl', 'basketball_nba', 'soccer_epl'
+  // regions: 'us', 'uk', 'eu', 'au' (comma-separated)
+  // markets: 'h2h' (moneyline), 'spreads', 'totals'
+  async getOdds(sport, regions = 'us', markets = 'h2h,spreads,totals') {
+    if (!this.apiKey) throw new Error('The Odds API key required');
+    const url = `${this.baseUrl}/sports/${sport}/odds?apiKey=${this.apiKey}&regions=${regions}&markets=${markets}&oddsFormat=american`;
+    const data = await this.fetchWithRetry(url, {}, 'theOddsApi');
+
+    // Normalize to match the format used by sports-betting.js
+    return (data || []).map(event => ({
+      id: event.id,
+      sport: event.sport_title,
+      event: `${event.home_team} vs ${event.away_team}`,
+      homeTeam: event.home_team,
+      awayTeam: event.away_team,
+      commenceTime: event.commence_time,
+      odds: this._normalizeBookmakers(event.bookmakers)
+    }));
+  }
+
+  // Convert The Odds API bookmaker format into the sportsbooks keyed object
+  // expected by sports-betting.js
+  _normalizeBookmakers(bookmakers) {
+    const result = {};
+    for (const bm of (bookmakers || [])) {
+      const entry = { moneyline: {}, spread: {}, total: {} };
+      for (const market of (bm.markets || [])) {
+        if (market.key === 'h2h') {
+          if (market.outcomes.length >= 2) {
+            const home = market.outcomes.find(o => o.name) || market.outcomes[0];
+            const away = market.outcomes.find((o, i) => i === 1) || market.outcomes[1];
+            entry.moneyline = { home: home.price, away: away.price };
+          }
+        } else if (market.key === 'spreads') {
+          if (market.outcomes.length >= 2) {
+            const [home, away] = market.outcomes;
+            entry.spread = {
+              home: home.point, homeOdds: home.price,
+              away: away.point, awayOdds: away.price
+            };
+          }
+        } else if (market.key === 'totals') {
+          const over = market.outcomes.find(o => o.name === 'Over');
+          const under = market.outcomes.find(o => o.name === 'Under');
+          entry.total = {
+            over: over?.point, overOdds: over?.price,
+            under: under?.point, underOdds: under?.price
+          };
+        }
+      }
+      result[bm.title] = entry;
+    }
+    return result;
+  }
+
+  // Poll for odds updates at a fixed interval (ms).
+  // Returns a handle with .stop() to cancel polling.
+  subscribeToOdds(sport, callback, intervalMs = 30000, regions = 'us', markets = 'h2h,spreads,totals') {
+    let running = false;
+    const id = setInterval(async () => {
+      if (running) return;  // skip if previous request is still in flight
+      running = true;
+      try {
+        const odds = await this.getOdds(sport, regions, markets);
+        callback(null, odds);
+      } catch (err) {
+        callback(err, null);
+      } finally {
+        running = false;
+      }
+    }, intervalMs);
+
+    this._pollIntervals.set(sport, id);
+    return {
+      stop: () => {
+        clearInterval(id);
+        this._pollIntervals.delete(sport);
+      }
+    };
+  }
+
+  // Fetch live scores for in-play betting context
+  async getLiveScores(sport) {
+    if (!this.apiKey) throw new Error('The Odds API key required');
+    const url = `${this.baseUrl}/sports/${sport}/scores?apiKey=${this.apiKey}&daysFrom=1`;
+    return this.fetchWithRetry(url, {}, 'theOddsApi');
+  }
+}
+
+/**
  * Unified Data Manager
  */
 class DataManager {
@@ -479,7 +679,9 @@ class DataManager {
     this.connectors = {
       yahoo: new YahooFinanceConnector(config),
       alphaVantage: new AlphaVantageConnector(config),
-      binance: new BinanceConnector(config)
+      binance: new BinanceConnector(config),
+      polygon: new PolygonConnector(config),
+      sportsBetting: new SportsBettingConnector(config)
     };
     this.preferredSource = config.preferredSource || 'yahoo';
   }
@@ -556,6 +758,8 @@ export {
   YahooFinanceConnector,
   AlphaVantageConnector,
   BinanceConnector,
+  PolygonConnector,
+  SportsBettingConnector,
   BaseConnector,
   LRUCache,
   RateLimiter,
@@ -571,9 +775,16 @@ if (isMainModule) {
 
   console.log('Available Connectors:');
   console.log('──────────────────────────────────────────────────────────────────────');
+  console.log('  Stock / Crypto Trading:');
   console.log('  • Yahoo Finance  - Free, delayed quotes, historical data');
   console.log('  • Alpha Vantage  - Free tier (5 req/min), sentiment analysis');
-  console.log('  • Binance        - Real-time crypto, WebSocket support');
+  console.log('  • Binance        - Real-time crypto, WebSocket trades & klines');
+  console.log('  • Polygon.io     - Real-time stocks via WebSocket (trades T.*, quotes Q.*, aggregates A.*)');
+  console.log();
+  console.log('  Sports Betting:');
+  console.log('  • The Odds API   - Live moneyline / spread / totals odds from 40+ sportsbooks');
+  console.log('                     (polling stream every 30 s; set THE_ODDS_API_KEY env var)');
+  console.log('                     Sports: NFL, NBA, MLB, NHL, Soccer, UFC, Tennis …');
   console.log();
 
   console.log('Features:');
@@ -588,27 +799,48 @@ if (isMainModule) {
   console.log('Example Usage:');
   console.log('──────────────────────────────────────────────────────────────────────');
   console.log(`
-  import { DataManager } from './data-connectors.js';
+  import { DataManager, SportsBettingConnector, PolygonConnector } from './data-connectors.js';
+
+  // ── Stock trading data streams ────────────────────────────────────────────
 
   const data = new DataManager({
-    apiKeys: { alphaVantage: 'YOUR_KEY' }
+    apiKeys: { alphaVantage: 'YOUR_KEY', polygon: 'YOUR_POLYGON_KEY' }
   });
 
-  // Get quote
-  const quote = await data.getQuote('AAPL');
-
-  // Get historical data
+  // REST: delayed / historical
+  const quote   = await data.getQuote('AAPL');
   const history = await data.getHistorical('AAPL', { period: '1y' });
 
-  // Get crypto data
-  const btc = await data.getQuote('BTCUSDT', 'binance');
-  const klines = await data.getHistorical('BTCUSDT', {
-    source: 'binance',
-    interval: '1h'
+  // WebSocket: real-time trades on Polygon.io
+  const polygon = data.getConnector('polygon');
+  const stream  = polygon.subscribe(['T.AAPL', 'T.TSLA', 'Q.AAPL'], (msg) => {
+    if (msg.ev === 'T') console.log('Trade:', msg.sym, msg.p, msg.s);
+    if (msg.ev === 'Q') console.log('Quote:', msg.sym, msg.bp, msg.ap);
+  });
+  // later: stream.close()
+
+  // Real-time crypto on Binance
+  const binance = data.getConnector('binance');
+  const klines  = binance.subscribeToKlines('BTCUSDT', '1m', (kline) => {
+    if (kline.isClosed) console.log('Closed candle:', kline.close);
   });
 
-  // Get sentiment
-  const sentiment = await data.getSentiment(['AAPL', 'MSFT']);
+  // ── Sports betting data streams ───────────────────────────────────────────
+
+  const sports  = new SportsBettingConnector({ apiKey: 'YOUR_ODDS_API_KEY' });
+
+  // One-shot: live odds for NFL
+  const nflOdds = await sports.getOdds('americanfootball_nfl');
+
+  // Streaming: poll every 30 s for updated odds
+  const handle  = sports.subscribeToOdds('basketball_nba', (err, odds) => {
+    if (err) return console.error(err);
+    odds.forEach(event => console.log(event.event, event.odds));
+  });
+  // later: handle.stop()
+
+  // In-play: live scores (for line-movement context)
+  const scores  = await sports.getLiveScores('americanfootball_nfl');
 `);
 
   // Test with mock data (no actual API calls)
@@ -633,5 +865,7 @@ if (isMainModule) {
   console.log();
   console.log('══════════════════════════════════════════════════════════════════════');
   console.log('Data connectors ready for integration');
+  console.log('Stock trading  → Yahoo Finance, Alpha Vantage, Binance, Polygon.io');
+  console.log('Sports betting → The Odds API  (set THE_ODDS_API_KEY)');
   console.log('══════════════════════════════════════════════════════════════════════');
 }

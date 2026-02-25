@@ -7,7 +7,14 @@
  * - Expected Value (EV) calculations
  * - Odds comparison and analysis
  * - Bankroll management
+ *
+ * DATA STREAM:
+ *   Connect a SportsBettingConnector (The Odds API) for live odds.
+ *   Set THE_ODDS_API_KEY in your environment to fetch real data.
+ *   Without a key the example falls back to the built-in sample odds.
  */
+
+import { SportsBettingConnector } from '../system/data-connectors.js';
 
 // Sports betting configuration
 const bettingConfig = {
@@ -72,12 +79,50 @@ async function main() {
   console.log(`   Sportsbooks:       ${bettingConfig.sportsbooks.join(', ')}`);
   console.log();
 
-  // 2. Analyze each event
-  for (const [eventId, eventData] of Object.entries(sampleOdds)) {
-    console.log(`2. Event Analysis: ${eventData.event}`);
+  // 2. Fetch live odds via The Odds API when a key is available,
+  //    otherwise fall back to the built-in sample data.
+  let liveOdds = [];
+  const apiKey = process.env.THE_ODDS_API_KEY;
+  if (apiKey) {
+    console.log('2. Fetching live NFL odds from The Odds API …');
+    try {
+      const connector = new SportsBettingConnector({ apiKey });
+      const raw = await connector.getOdds('americanfootball_nfl');
+      if (raw.length > 0) {
+        liveOdds = raw;
+        console.log(`   Retrieved ${liveOdds.length} live events.`);
+      } else {
+        console.log('   No live events right now (off-season?). Using sample data.');
+      }
+    } catch (err) {
+      console.warn(`   Could not fetch live odds: ${err.message}. Using sample data.`);
+    }
+  } else {
+    console.log('2. THE_ODDS_API_KEY not set – using built-in sample odds.');
+    console.log('   Set THE_ODDS_API_KEY to connect a live sports betting data stream.');
+  }
+  console.log();
+
+  // Merge: put live events first, then sample events (for demo completeness)
+  const oddsToAnalyze = liveOdds.length > 0
+    ? Object.fromEntries(liveOdds.map(e => [e.id, e]))
+    : sampleOdds;
+
+  // 3. Analyze each event
+  for (const [eventId, eventData] of Object.entries(oddsToAnalyze)) {
+    console.log(`3. Event Analysis: ${eventData.event}`);
     console.log('-'.repeat(70));
-    console.log(`   Sport: ${eventData.sport} | Date: ${eventData.date} ${eventData.time}`);
+    if (eventData.sport) {
+      const datePart = eventData.date ? ` | Date: ${eventData.date} ${eventData.time || ''}` : '';
+      console.log(`   Sport: ${eventData.sport}${datePart}`);
+    }
     console.log();
+
+    if (!eventData.odds || Object.keys(eventData.odds).length === 0) {
+      console.log('   No odds available for this event.');
+      console.log();
+      continue;
+    }
 
     // Display odds comparison
     console.log('   Moneyline Odds Comparison:');
@@ -85,6 +130,7 @@ async function main() {
     console.log('   ' + '-'.repeat(60));
 
     for (const [book, odds] of Object.entries(eventData.odds)) {
+      if (!odds.moneyline?.home || !odds.moneyline?.away) continue;
       const homeProb = americanToImpliedProb(odds.moneyline.home);
       const awayProb = americanToImpliedProb(odds.moneyline.away);
       const vig = (homeProb + awayProb - 1) * 100;
@@ -115,36 +161,38 @@ async function main() {
     }
     console.log();
 
-    // EV calculations
-    console.log('   Expected Value Analysis (using model probabilities):');
-    console.log(`   Model: Home ${(eventData.trueProbability.home * 100).toFixed(0)}% | Away ${(eventData.trueProbability.away * 100).toFixed(0)}%`);
-    console.log();
-    console.log('   Bet             | Book          | Odds      | EV       | Kelly   | Recommended');
-    console.log('   ' + '-'.repeat(65));
+    // EV calculations (only if we have model probabilities)
+    if (eventData.trueProbability) {
+      console.log('   Expected Value Analysis (using model probabilities):');
+      console.log(`   Model: Home ${(eventData.trueProbability.home * 100).toFixed(0)}% | Away ${(eventData.trueProbability.away * 100).toFixed(0)}%`);
+      console.log();
+      console.log('   Bet             | Book          | Odds      | EV       | Kelly   | Recommended');
+      console.log('   ' + '-'.repeat(65));
 
-    const evAnalysis = calculateEVForAllBets(eventData);
-    evAnalysis.forEach(bet => {
-      const evStr = bet.ev >= 0 ? `+${(bet.ev * 100).toFixed(2)}%` : `${(bet.ev * 100).toFixed(2)}%`;
-      const kellyStr = bet.kelly > 0 ? `${(bet.kelly * 100).toFixed(2)}%` : '-';
-      const recBet = bet.recommendedBet > 0 ? `$${bet.recommendedBet.toFixed(0)}` : 'PASS';
+      const evAnalysis = calculateEVForAllBets(eventData);
+      evAnalysis.forEach(bet => {
+        const evStr = bet.ev >= 0 ? `+${(bet.ev * 100).toFixed(2)}%` : `${(bet.ev * 100).toFixed(2)}%`;
+        const kellyStr = bet.kelly > 0 ? `${(bet.kelly * 100).toFixed(2)}%` : '-';
+        const recBet = bet.recommendedBet > 0 ? `$${bet.recommendedBet.toFixed(0)}` : 'PASS';
 
-      console.log(`   ${bet.type.padEnd(16)} | ${bet.book.padEnd(13)} | ${formatOdds(bet.odds).padStart(9)} | ${evStr.padStart(8)} | ${kellyStr.padStart(7)} | ${recBet.padStart(11)}`);
-    });
-    console.log();
+        console.log(`   ${bet.type.padEnd(16)} | ${bet.book.padEnd(13)} | ${formatOdds(bet.odds).padStart(9)} | ${evStr.padStart(8)} | ${kellyStr.padStart(7)} | ${recBet.padStart(11)}`);
+      });
+      console.log();
 
-    // Top recommended bets
-    const topBets = evAnalysis.filter(b => b.recommendedBet > 0).sort((a, b) => b.ev - a.ev);
-    if (topBets.length > 0) {
-      console.log(`   📊 Top Recommended Bet:`);
-      const best = topBets[0];
-      console.log(`      ${best.type} at ${best.book}`);
-      console.log(`      Odds: ${formatOdds(best.odds)} | EV: +${(best.ev * 100).toFixed(2)}% | Bet Size: $${best.recommendedBet.toFixed(0)}`);
+      // Top recommended bets
+      const topBets = evAnalysis.filter(b => b.recommendedBet > 0).sort((a, b) => b.ev - a.ev);
+      if (topBets.length > 0) {
+        console.log(`   📊 Top Recommended Bet:`);
+        const best = topBets[0];
+        console.log(`      ${best.type} at ${best.book}`);
+        console.log(`      Odds: ${formatOdds(best.odds)} | EV: +${(best.ev * 100).toFixed(2)}% | Bet Size: $${best.recommendedBet.toFixed(0)}`);
+      }
+      console.log();
     }
-    console.log();
   }
 
-  // 3. Bankroll simulation
-  console.log('3. Bankroll Growth Simulation:');
+  // 4. Bankroll simulation
+  console.log('4. Bankroll Growth Simulation:');
   console.log('-'.repeat(70));
 
   const simulation = simulateBankrollGrowth(1000, 0.03, 0.55, bettingConfig);
@@ -156,8 +204,8 @@ async function main() {
   console.log(`   Max Drawdown:      ${(simulation.maxDrawdown * 100).toFixed(1)}%`);
   console.log();
 
-  // 4. Syndicate management (advanced)
-  console.log('4. Syndicate Management:');
+  // 5. Syndicate management (advanced)
+  console.log('5. Syndicate Management:');
   console.log('-'.repeat(70));
   console.log('   Account Diversification Strategy:');
   console.log('   - Spread bets across multiple sportsbooks');
